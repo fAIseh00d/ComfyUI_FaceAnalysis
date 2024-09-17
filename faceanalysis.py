@@ -24,6 +24,9 @@ import folder_paths
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont, ImageColor
 
+from sklearn.cluster import OPTICS
+from collections import Counter
+
 DLIB_DIR = os.path.join(os.path.dirname(os.path.realpath(__file__)), "dlib")
 INSIGHTFACE_DIR = os.path.join(folder_paths.models_dir, "insightface")
 
@@ -374,8 +377,8 @@ class FaceEmbedDistance:
             },
         }
 
-    RETURN_TYPES = ("IMAGE", "FLOAT")
-    RETURN_NAMES = ("IMAGE", "distance")
+    RETURN_TYPES = ("IMAGE", "FLOAT", "INT")
+    RETURN_NAMES = ("IMAGE", "distance", "indices")
     FUNCTION = "analize"
     CATEGORY = "FaceAnalysis"
 
@@ -403,6 +406,8 @@ class FaceEmbedDistance:
 
         out = []
         out_dist = []
+        out_idx = []
+        idx = 0 
         
         for i in image:
             img = np.array(T.ToPILImage()(i.permute(2, 0, 1)).convert('RGB'))
@@ -446,6 +451,8 @@ class FaceEmbedDistance:
                 else:
                     out.append(i)
 
+                out_idx.append(idx)
+                idx += 1
                 out_dist.append(dist)
 
         if not out:
@@ -463,7 +470,7 @@ class FaceEmbedDistance:
         if out.shape[3] > 3:
             out = out[:, :, :, :3]
 
-        return(out, out_dist,)
+        return(out, out_dist, out_idx, )
 
 class FaceAlign:
     @classmethod
@@ -779,6 +786,79 @@ class FaceWarp:
 
         return (result_image, result_mask)
 
+class FaceEmbedCluster:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "analysis_models": ("ANALYSIS_MODELS", ),
+                "image": ("IMAGE", ),
+                "filter_thresh": ("FLOAT", { "default": 0.68, "step": 0.001 }),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "INT")
+    RETURN_NAMES = ("IMAGE", "indices")
+    FUNCTION = "cluster"
+    CATEGORY = "FaceAnalysis"
+
+    def cluster(self, analysis_models, image, filter_thresh):
+        
+        embeds = []
+        out_idx = []
+        
+        for i in image:
+            img = np.array(T.ToPILImage()(i.permute(2, 0, 1)).convert('RGB'))
+            img = analysis_models.get_embeds(img)
+            if img is not None:
+                embeds.append(torch.from_numpy(img))
+        
+        if embeds == []:
+            # No faces detected in images
+            raise Exception('No face detected in images')
+        elif len(embeds) == 1:
+            # Input image passthrough
+            out_img = image
+            out_idx = [0]
+        elif len(embeds) == 2:
+            # Calculate cosine distance between two embeddings and return first or both if threshold is met
+            img1 = embeds[0]
+            img2 = embeds[1]
+            dist = np.float64(1 - np.dot(img1, img2) / (np.linalg.norm(img1) * np.linalg.norm(img2)))
+            out_img = image if dist < filter_thresh else [image[0]]
+            out_idx = [0, 1] if dist < filter_thresh else [0]
+        else:
+            embeds = torch.stack(embeds).numpy()
+
+            # Normalize the embeddings to have unit norm
+            normalized_embeddings = embeds / np.linalg.norm(embeds, axis=1, keepdims=True)
+
+            # Apply OPTICS clustering
+            # max_eps is the maximum distance between two samples for them to be considered as in the same cluster
+            # min_samples is the minimum number of samples in a cluster
+            db = OPTICS(max_eps=filter_thresh, min_samples=2, metric='cosine').fit(normalized_embeddings)
+
+            # Get cluster labels (-1 is noise, ignore those)
+            labels = db.labels_
+
+            # Count occurrences of each cluster
+            label_counts = Counter(labels)
+
+            # Ignore the noise cluster (-1)
+            if -1 in label_counts:
+                del label_counts[-1]
+
+            # Find the largest cluster label
+            most_common_label = label_counts.most_common(1)[0][0]
+            # Get the embeddings in the largest cluster
+            most_common_embeddings = np.array(embeds)[labels == most_common_label]
+
+            out_idx = [i for i, val in enumerate(labels) if val == most_common_label]
+            
+            out_img = [image[i] for i in out_idx]
+
+        return(out_img, out_idx, )
+
 """
 def cos_distance(source, test):
     a = np.matmul(np.transpose(source), test)
@@ -803,6 +883,7 @@ def l2_normalize(x):
 
 NODE_CLASS_MAPPINGS = {
     "FaceEmbedDistance": FaceEmbedDistance,
+    "FaceEmbedCluster": FaceEmbedCluster,
     "FaceAnalysisModels": FaceAnalysisModels,
     "FaceBoundingBox": FaceBoundingBox,
     "FaceAlign": FaceAlign,
@@ -812,6 +893,7 @@ NODE_CLASS_MAPPINGS = {
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "FaceEmbedDistance": "Face Embeds Distance",
+    "FaceEmbedCluster": "FaceEmbedCluster", 
     "FaceAnalysisModels": "Face Analysis Models",
     "FaceBoundingBox": "Face Bounding Box",
     "FaceAlign": "Face Align",
