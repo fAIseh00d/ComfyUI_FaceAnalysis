@@ -8,6 +8,7 @@ except ImportError:
 IS_INSIGHTFACE_INSTALLED = False
 try:
     from insightface.app import FaceAnalysis
+    from insightface.app.common import Face
     IS_INSIGHTFACE_INSTALLED = True
 except ImportError:
     pass
@@ -24,8 +25,9 @@ import folder_paths
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont, ImageColor
 
-from sklearn.cluster import OPTICS
+from sklearn.cluster import OPTICS, DBSCAN
 from collections import Counter
+from itertools import chain
 
 DLIB_DIR = os.path.join(os.path.dirname(os.path.realpath(__file__)), "dlib")
 INSIGHTFACE_DIR = os.path.join(folder_paths.models_dir, "insightface")
@@ -792,72 +794,91 @@ class FaceEmbedCluster:
         return {
             "required": {
                 "analysis_models": ("ANALYSIS_MODELS", ),
-                "image": ("IMAGE", ),
+                "images": ("IMAGE", ),
                 "filter_thresh": ("FLOAT", { "default": 0.68, "step": 0.001 }),
+                "clusterizer": (["DBSCAN", "OPTICS"], ),
             },
         }
 
-    RETURN_TYPES = ("IMAGE", "INT")
-    RETURN_NAMES = ("IMAGE", "indices")
+    RETURN_TYPES = ("IMAGE", "INT", "FACE_MODEL")
+    RETURN_NAMES = ("IMAGE", "indices", "FACE_MODEL")
+    INPUT_IS_LIST = True
+    OUTPUT_IS_LIST = (True, False, False)
     FUNCTION = "cluster"
     CATEGORY = "FaceAnalysis"
 
-    def cluster(self, analysis_models, image, filter_thresh):
-        
+    def cluster(self, analysis_models, images, filter_thresh, clusterizer):
+        # Flatten list of image batches
+        flattened_images = list(chain.from_iterable(images))
+        analysis_models = analysis_models[0]
+        filter_thresh = filter_thresh[0]
+        clusterizer = clusterizer[0]
         embeds = []
-        out_idx = []
-        
-        for i in image:
-            img = np.array(T.ToPILImage()(i.permute(2, 0, 1)).convert('RGB'))
-            img = analysis_models.get_embeds(img)
-            if img is not None:
-                embeds.append(torch.from_numpy(img))
-        
-        if embeds == []:
-            # No faces detected in images
-            raise Exception('No face detected in images')
-        elif len(embeds) == 1:
-            # Input image passthrough
-            out_img = image
-            out_idx = [0]
-        elif len(embeds) == 2:
-            # Calculate cosine distance between two embeddings and return first or both if threshold is met
-            img1 = embeds[0]
-            img2 = embeds[1]
-            dist = np.float64(1 - np.dot(img1, img2) / (np.linalg.norm(img1) * np.linalg.norm(img2)))
-            out_img = image if dist < filter_thresh else [image[0]]
-            out_idx = [0, 1] if dist < filter_thresh else [0]
+
+        for img in flattened_images:
+            img = tensor_to_image(img)
+            embedding = analysis_models.get_embeds(img)
+            if embedding is not None:
+                embeds.append(torch.from_numpy(embedding))
+
+        if not embeds:
+            raise Exception("No faces detected in any images.")
         else:
             embeds = torch.stack(embeds).numpy()
 
-            # Normalize the embeddings to have unit norm
+        if len(embeds) == 1:
+            out_idx = [0]
+        elif len(embeds) == 2:
+            # Compute cosine distance for two embeddings
+            dist = np.float64(1 - np.dot(embeds[0], embeds[1]) / (np.linalg.norm(embeds[0]) * np.linalg.norm(embeds[1])))
+            out_idx = [0, 1] if dist < filter_thresh else [0]
+        else:
+            # Normalize embeddings for clustering (optional for insightface)
             normalized_embeddings = embeds / np.linalg.norm(embeds, axis=1, keepdims=True)
 
-            # Apply OPTICS clustering
-            # max_eps is the maximum distance between two samples for them to be considered as in the same cluster
-            # min_samples is the minimum number of samples in a cluster
-            db = OPTICS(max_eps=filter_thresh, min_samples=2, metric='cosine').fit(normalized_embeddings)
+            # Apply clustering algorithm
+            if clusterizer == 'OPTICS':
+                clustering_model = OPTICS(max_eps=filter_thresh, min_samples=2, metric='cosine')
+            elif clusterizer == 'DBSCAN':
+                clustering_model = DBSCAN(eps=filter_thresh, min_samples=2, metric='cosine')
 
-            # Get cluster labels (-1 is noise, ignore those)
-            labels = db.labels_
-
-            # Count occurrences of each cluster
+            labels = clustering_model.fit_predict(normalized_embeddings)
             label_counts = Counter(labels)
 
-            # Ignore the noise cluster (-1)
-            if -1 in label_counts:
-                del label_counts[-1]
+            # Remove noise (-1) from clusters
+            label_counts.pop(-1, None)
 
-            # Find the largest cluster label
-            most_common_label = label_counts.most_common(1)[0][0]
-            # Get the embeddings in the largest cluster
-            most_common_embeddings = np.array(embeds)[labels == most_common_label]
+            # Determine the largest cluster
+            most_common_label = label_counts.most_common(1)[0][0] if label_counts else None
+            out_idx = [i for i, lbl in enumerate(labels) if lbl == most_common_label] if most_common_label is not None else [0]
 
-            out_idx = [i for i, val in enumerate(labels) if val == most_common_label]
-            
-            out_img = [image[i] for i in out_idx]
+        # Extract target embeddings and compute blended embedding
+        target_embeds = np.array([embeds[i] for i in out_idx])
+        blended_embedding = np.mean(target_embeds, axis=0)
+        blended_embedding = blended_embedding / np.linalg.norm(blended_embedding)
 
-        return(out_img, out_idx, )
+        # Retrieve face details and assign blended embedding
+        first_image = tensor_to_image(flattened_images[out_idx[0]])
+        blended_face = analysis_models.get_face(first_image)
+        blended_face[0]["embedding"] = blended_embedding
+
+        # Empty face with no recomputation option:
+        #blended_face = Face(
+        #            bbox=np.zeros(4, dtype=np.float32),
+        #            kps=np.zeros((5, 2), dtype=np.float32),
+        #            det_score=1.0,
+        #            landmark_3d_68=np.zeros((68, 3), dtype=int),
+        #            pose=np.zeros(3, dtype=int),
+        #            landmark_2d_106=np.zeros((106, 2), dtype=int),
+        #            embedding=blended_embedding,
+        #            gender=0,
+        #            age=99
+        #)
+
+        # Return only clustered images
+        out_img = [flattened_images[i].unsqueeze(0) for i in out_idx]
+
+        return(out_img, out_idx, blended_face[0],)
 
 """
 def cos_distance(source, test):
