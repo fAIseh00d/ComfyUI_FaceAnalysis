@@ -880,6 +880,31 @@ class FaceEmbedCluster:
 
         return(out_img, out_idx, blended_face[0],)
 
+class GetImagesFromList:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "images": ("IMAGE", ),
+                "indices": ("INT", ),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "INT")
+    RETURN_NAMES = ("IMAGE", "indices")
+    INPUT_IS_LIST = True
+    OUTPUT_IS_LIST = (True, False)
+    FUNCTION = "doit"
+    CATEGORY = "FaceAnalysis"
+    
+    def doit(self, images, indices):
+        indices = indices[0] if any(isinstance(i, list) for i in indices) else indices
+
+        flattened_images = list(chain.from_iterable(images))
+        out_img = [flattened_images[i].unsqueeze(0) for i in indices]
+
+        return(out_img, indices,)
+
 """
 def cos_distance(source, test):
     a = np.matmul(np.transpose(source), test)
@@ -910,14 +935,16 @@ NODE_CLASS_MAPPINGS = {
     "FaceAlign": FaceAlign,
     "FaceSegmentation": faceSegmentation,
     "FaceWarp": FaceWarp,
+    "GetImagesFromList": GetImagesFromList,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "FaceEmbedDistance": "Face Embeds Distance",
-    "FaceEmbedCluster": "FaceEmbedCluster", 
+    "FaceEmbedCluster": "Face Embeds Cluster", 
     "FaceAnalysisModels": "Face Analysis Models",
     "FaceBoundingBox": "Face Bounding Box",
     "FaceAlign": "Face Align",
     "FaceSegmentation": "Face Segmentation",
     "FaceWarp": "Face Warp",
+    "GetImagesFromList": "Get Images From List Indexed",
 }
